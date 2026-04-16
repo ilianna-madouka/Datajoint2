@@ -1,8 +1,8 @@
 %{
 # Object decoding sith simulated responses
--> simf.RFParams
--> simf.ActivityParams
--> simf.DecodeOpt
+-> simfilt.RFParams
+-> simfilt.ActivityParams
+-> simfilt.DecodeOpt
 ---
 p                     : longblob                      # performance
 p_shuffle             : longblob                      # chance performance
@@ -17,23 +17,25 @@ classdef Dec < dj.Computed
     %#ok<*INUSL>
     
     properties
-        keySource  = (simf.RFParams) * (simf.ActivityParams & simf.Activity)...
-            * (simf.DecodeOpt & 'process = "yes"')
+        keySource  = (simfilt.DecodeOpt & 'process = "yes"') * proj(simfilt.RFParams & simfilt.RFRaw) * proj(simfilt.ActivityParams & simfilt.Activity)
     end
     
     methods(Access=protected)
         function makeTuples(self, key)
             
             % get train & test groups
-            [train_set,test_set] = fetch1(simf.DecodeOpt & key,'train_set','test_set');
+            [train_set,test_set] = fetch1(simfilt.DecodeOpt & key,'train_set','test_set');
             assert(~isempty(train_set));
             [train_groups,test_groups] = getGroups(self,train_set,test_set);
-            stims = cellfun(@(x) unique(cellfun(@(y) y{1},x,'uni',0)),train_groups,'uni',0);
+            stims = cellfun(@(x) unique(cellfun(@(y) y,x,'uni',0)),train_groups{1},'uni',0);
             Stims = unique([stims{:}])';
-            
+            if ~isempty(test_groups)
+                stims = cellfun(@(x) unique(cellfun(@(y) y,x,'uni',0)),test_groups{1},'uni',0);
+                Stims = [Stims;unique([stims{:}])'];
+            end
             
             % get DAta
-            [Traces, Unit_ids] = getData(self,Stims,key); % [Cells, Obj, Trials]
+            [Traces, Unit_ids,ClipData] = getData(self,Stims,key); % [Cells, Obj, Trials]
             if ~isempty(test_groups)
                 train_sz = cell2mat(cellfun(@size,train_groups,'uni',0));
                 test_sz = cell2mat(cellfun(@size,test_groups,'uni',0));
@@ -41,8 +43,8 @@ classdef Dec < dj.Computed
             end
             
             % create StimInfo
+            StimInfo.clips = ClipData;
             for istim =1:length(Stims)
-                StimInfo.clips{istim} = ones(size(Traces{istim},2),1);
                 StimInfo.bins{istim} = (1:size(Traces{istim},2))';
                 StimInfo.names{istim} = repmat(Stims(istim),size(Traces{istim},2),1);
             end
@@ -86,27 +88,56 @@ classdef Dec < dj.Computed
             end
             
             % find unit ids from randomization indexes
-            info = [];
-            info.units = cellfun(@(x) cellfun(@(xx) Unit_ids(xx),x,'uni',0),unit_idx,'uni',0);
+            test_info.units = cellfun(@(x) cellfun(@(xx) Unit_ids(xx),x,'uni',0),unit_idx,'uni',0);
             
             % insert
             key.p = P;
             key.p_shuffle = P_shfl;
             key.train_groups = train_groups;
             key.test_groups = test_groups;
-            key.trial_info = info;
+            key.trial_info = test_info;
             key.score = score;
             self.insert(key)
         end
     end
     
     methods
-        function [Data, Unit_ids, Stim] = getData(self,Stims,key)
-            Data = [];
+        function [Data, Unit_ids, Clip] = getData(self,Stims,key)
+            Data = [];Clip = [];
+            clipinfo = fetch1(simfilt.DecodeOpt & key,'clips');
+            
             for iStim = 1:length(Stims)
                 k.movie_name = Stims{iStim};
-                [traces, ids] = fetchn(simf.ActivityTrace & key & k,'trace','filter_id');
-                Data{iStim} = cell2mat(traces);
+                if clipinfo
+                    clips = eval(clipinfo);
+                    Data{iStim} = [];
+                    Clip{iStim} = [];
+                    for clip = clips
+                        k.clip_number = clip;
+                        [traces, ids] = fetchn(simfilt.ActivityTrace & key & k,'trace','filter_id');
+                        Data{iStim} = [Data{iStim},cell2mat(traces)];
+                        Clip{iStim} = [Clip{iStim};ones(size(traces{1},2),1)*clip];
+                    end
+                else
+                    [traces, ids, clip_number] = fetchn(simfilt.ActivityTrace & key & k,'trace','filter_id','clip_number');
+                    mn_l = min(cellfun(@length,traces));
+                    traces = cellfun(@(x)  x(1:mn_l),traces,'uni',0);
+
+                    un_idx = unique(ids);
+                    Traces = [];Clips = [];
+                    for i =1:length(un_idx)
+                        Traces{i} = cell2mat(traces(ids==un_idx(i))');
+                        if i==1
+                            clip_ids = clip_number(ids==un_idx(i));
+                            Clips = [];
+                            for iclip = 1:length(clip_ids)
+                                Clips{iclip} = ones(length(traces{1}),1)*clip_ids(iclip);
+                            end
+                            Clip{iStim} = cell2mat(Clips');
+                        end
+                    end
+                    Data{iStim} = cell2mat(Traces');
+                end
             end
             Unit_ids = ids;
         end
@@ -136,18 +167,18 @@ classdef Dec < dj.Computed
             
             % get decoder parameters
             [decoder,k_fold,shuffle,repetitions,select_method,...
-                dec_params, neurons,fold_selection,noise] = ...
-                fetch1(simf.DecodeOpt & key,...
+                dec_params, neurons,fold_selection,noise,samples,dat_norm,firing_rate] = ...
+                fetch1(simfilt.DecodeOpt & key,...
                 'decoder','k_fold','shuffle','repetitions','select_method',...
-                'dec_params','neurons','fold_selection','noise');
-            binsize = fetch1(simf.RFParams & key,'binsize');
+                'dec_params','neurons','fold_selection','noise','samples','normalize','firing_rate');
+            binsize = fetch1(simfilt.RFParams & key,'binsize');
             
             % define decoder function
             if ~isempty(dec_params);dec_params = [',' dec_params];end
             decoder_func = eval(sprintf('@(X,IDs) %s(X, IDs%s)',decoder,dec_params));
             
             % get test data
-            if isempty(test_Data)
+             if isempty(test_Data)
                 test_Data = Data;
             end
             
@@ -165,23 +196,48 @@ classdef Dec < dj.Computed
                 group_num = length(Data);
                 
                 % equalize by undersampling shorter class & randomize trial sequence
-                msz = min(cellfun(@(x) size(x,2),Data)); % calculate minimum class length
+                if samples == 0
+                    msz = min(cellfun(@(x) size(x,2),Data)); % calculate minimum class length
+                    msz_test = min(cellfun(@(x) size(x,2),test_Data)); % calculate minimum class length
+                else
+                    msz = samples;
+                    msz_test = samples;
+                end
                 
                 % calculate fold bin size and recompute minimum length of data
                 if k_fold<2;bins = msz;else;bins = k_fold;end
                 bin_sz = floor(msz/bins);
                 msz = bin_sz*bins;
                 
-                % undersample data
-                train_data_idx = cellfun(@(x) randperm(rseed,size(x,2),msz),Data,'uni',0);% create bin index
+%                 % undersample data
+%                 train_data_idx = cellfun(@(x) randperm(rseed,msz,msz),Data,'uni',0);% create bin index
+
+%                 % equalize by undersampling shorter class & randomize trial sequence
+%                 msz = min(cellfun(@(x) size(x,2),test_Data)); % calculate minimum class length
+%                 test_bin_sz = floor(msz/bins); % calculate fold bin size and recompute minimum length of data
+%                 msz = test_bin_sz*bins;
+%                 rseed.reset;
+%                 test_data_idx = cellfun(@(x) randperm(rseed,msz,msz),test_Data,'uni',0);
+%                 
+%                 % undersample data
+%                 train_data_idx = cellfun(@(x) randperm(rseed,msz,msz),Data,'uni',0);% create bin index
+%                 
+%                 % equalize by undersampling shorter class & randomize trial sequence
+%                 msz = min(cellfun(@(x) size(x,2),test_Data)); % calculate minimum class length
+%                 test_bin_sz = floor(msz/bins); % calculate fold bin size and recompute minimum length of data
+%                 msz = test_bin_sz*bins;
+%                 rseed.reset;
+%                 test_data_idx = cellfun(@(x) randperm(rseed,msz,msz),test_Data,'uni',0);
                 
                 % equalize by undersampling shorter class & randomize trial sequence
-                msz = min(cellfun(@(x) size(x,2),test_Data)); % calculate minimum class length
-                test_bin_sz = floor(msz/bins); % calculate fold bin size and recompute minimum length of data
-                msz = test_bin_sz*bins;
-                rseed.reset;
-                test_data_idx = cellfun(@(x) randperm(rseed,size(x,2),msz),test_Data,'uni',0);
-                
+              
+                test_bin_sz = floor(msz_test/bins); % calculate fold bin size and recompute minimum length of data
+                msz_test = test_bin_sz*bins;
+                rseed.reset
+
+                % undersample data
+                train_data_idx = cellfun(@(x) randperm(rseed,msz,msz),Data,'uni',0);% create bin index
+                test_data_idx = cellfun(@(x) randperm(rseed,msz_test,msz_test),test_Data,'uni',0); % this should be the same as train for the crossvalidation to work?
                 % make group identities & build indexes
                 for iclass = 1:group_num
                     % make group identities
@@ -195,20 +251,63 @@ classdef Dec < dj.Computed
                                 train_idx{iclass}(1 + (ibin-1)*bin_sz      :      bin_sz*ibin) = ibin;
                                 test_idx{iclass} (1 + (ibin-1)*test_bin_sz : test_bin_sz*ibin) = ibin;
                             end
+                        case 'firing_rate'
+                            ctrl_data = exprnd(firing_rate,samples,1)';
+                            smd = sort(mean(Data{iclass}));
+                            offset = 1;
+                            for i = 1:100000
+                                 offset = offset + 1;
+                                 new_data = smd(1+offset:samples+offset);
+                                 if ttest(ctrl_data, new_data)==0
+                                     break
+                                 end
+                            end
+                            idx = 1+offset:samples+offset;
+                            idx = idx(randsample(500,500));
+                            train_data_idx{iclass} = idx;% create bin index
+                            test_data_idx{iclass} = idx;
+
+                            % buld index
+                            for ibin = 1:bins
+                                train_idx{iclass}(1 + (ibin-1)*bin_sz      :      bin_sz*ibin) = ibin;
+                                test_idx{iclass} (1 + (ibin-1)*test_bin_sz : test_bin_sz*ibin) = ibin;
+                            end
                         case {'x','y','frame_id','scale','rotation','tilt','light1_xloc','light1_yloc','light3_yloc','light2_ene'}
-                            
                             keys = cell2struct([num2cell(train_info.clips{iclass}(train_data_idx{iclass}),2),...
                                 train_info.names{iclass}(train_data_idx{iclass})']',{'clip_number','movie_name'},1);
+                            idx = [1;find(diff(train_info.clips{1})>0)+1];
+                            train_info.bins{1} = reshape((repmat(1:min(diff(idx)),length(idx),1))',[],1);
+                            idx = [1;find(diff(train_info.clips{2})>0)+1];
+                            train_info.bins{2} = reshape((repmat(1:min(diff(idx)),length(idx),1))',[],1);
+                            [keys.animal_id] = deal(9254);
+                            [keys.session] = deal(1);
                             param = getParam(stimulus.MovieParams, keys, fold_selection, ...
                                 train_info.bins{iclass}(train_data_idx{iclass})*binsize/1000 - binsize/2/1000);
-                            [~, sort_idx] = histc(param,[-inf; quantile(param,bins-1)'; inf]);
+                            if bins>2; v = quantile(param,bins-1)'; else v  = prctile(param,50);end
+                            [~, sort_idx] = histc(param,[-inf; v; inf]);
                             train_idx{iclass} = sort_idx(:)';
                             keys = cell2struct([num2cell(test_info.clips{iclass}(test_data_idx{iclass}),2),...
                                 test_info.names{iclass}(test_data_idx{iclass})']',{'clip_number','movie_name'},1);
+                            idx = [1;find(diff(test_info.clips{1})>0)+1];
+                            test_info.bins{1} = reshape((repmat(1:min(diff(idx)),length(idx),1))',[],1);
+                             idx = [1;find(diff(test_info.clips{2})>0)+1];
+                            test_info.bins{2} = reshape((repmat(1:min(diff(idx)),length(idx),1))',[],1);
+                             [keys.animal_id] = deal(9254);
+                            [keys.session] = deal(1);
                             param = getParam(stimulus.MovieParams, keys, fold_selection, ...
                                 test_info.bins{iclass}(test_data_idx{iclass})*binsize/1000 - binsize/2/1000);
-                            [~, sort_idx] = histc(param,[-inf; quantile(param,bins-1)'; inf]);
+                            if bins>2; v = quantile(param,bins-1)'; else v  = prctile(param,50);end
+                            [~, sort_idx] = histc(param,[-inf; v; inf]);
                             test_idx{iclass} = sort_idx(:)';
+                        case 'clips'
+                            for ibin = 1:bins
+                                train_clips(1 + (ibin-1)*bin_sz      :      bin_sz*ibin) = ibin;
+                                test_clips(1 + (ibin-1)*test_bin_sz : test_bin_sz*ibin) = ibin;
+                            end
+                            [~,~, t] = unique(train_clips(train_data_idx{iclass}));
+                            train_idx{iclass} = t';
+                            [~,~,t] = unique(test_clips(test_data_idx{iclass}));
+                            test_idx{iclass} = t';
                         otherwise
                             error('Fold selection method not implemented!')
                     end
@@ -222,6 +321,18 @@ classdef Dec < dj.Computed
                 train_idx = cell2mat(train_idx);
                 test_idx = cell2mat(test_idx);
                 test_data_idx = cell2mat(test_data_idx);
+
+                % normalize data
+                if dat_norm
+                    mdata = mean(data,2);
+                    sdata = std(data,[],2);
+                else
+                    mdata = zeros(size(data,1),1);
+                    sdata = ones(size(data,1),1);
+                end
+                
+                data = bsxfun(@rdivide, bsxfun(@minus,data,mdata),sdata);
+                test_data = bsxfun(@rdivide, bsxfun(@minus,test_data,mdata),sdata);
                 
                 % make nan zeros
                 data(isnan(data)) = prctile(data(:),1);
@@ -280,6 +391,9 @@ classdef Dec < dj.Computed
                             R{igroup}(icell,data_shfl_idx(tidx & test_shfl_groups==igroup)) = ...
                                 r(test_shfl_groups(tidx)==igroup);
                             S{igroup}(icell,test_data_idx(tidx & test_groups==igroup)) = sc(test_groups(tidx)==igroup,1);
+                            D{igroup}{icell,ibin}(3,:) = mdata(cell_idx(cell_num(icell,:)));
+                            D{igroup}{icell,ibin}(4,:) = sdata(cell_idx(cell_num(icell,:)));
+
                         end
                     end
                     Cells{irep}{icell} = cell_idx(cell_num(icell,:));
@@ -371,72 +485,87 @@ classdef Dec < dj.Computed
             end
         end
         
-        function plotMasks(self,varargin)
+        function [perf, keys] = getPerformance2(self,varargin)
             
-            params.fontsize = 10;
-            params.mi = 1;
             params.target_cell_num = [];
-            params.mx = [];
-            params.mn = [];
-            params.tinybar = true;
-            params.colormap = [];
-            params.sitenum = true;
+            params.perf = 'p';
+            params.mi = 1;
+            params.data = [];
+            params.autoconvert = true;
+            params.reps = false;
+            params.median_over_trials = false;
             
             params = getParams(params,varargin);
             
-            % adjust colors
-            if isempty(params.colormap)
-                %                 params.colormap = parula(30);
-                colors = cbrewer('seq','YlPuBl',150);
-                params.colormap = colors(1:end-40,:);
+            [p, ti, keys] = fetchn(self, params.perf,'trial_info');
+            if ~isempty(params.data)
+                p = {params.data};
             end
             
-            % get data
-            [area, keys] = fetchn(self & 'brain_area <> "unknown"',...
-                'brain_area');
-            
-            areas = unique(area);
-            MI = cell(size(areas));
-            for iarea = 1:length(areas)
-                idx = (strcmp(area,areas(iarea)));
-                p = getPerformance(self & keys(idx),params);
-                if iscell(p);p = cellfun(@nanmean,p);end
-                MI{iarea} = p;
+            % remove empty classes
+            p = cellfun(@(x) x(:,any(~cellfun(@isempty,x),1)),p,'uni',0);
+            perf = cell(length(p),1);
+            for ikey = 1:length(p)
+                if params.reps
+                    p{ikey} = cellfun(@(x) permute(x(:,:,size(p{ikey}{1},3)),[3 2 1]),p{ikey},'uni',0);
+                    ncel =1:size(p{ikey}{1},3);
+                elseif isempty(params.target_cell_num)
+                    ncel =1:size(p{ikey}{1},3);
+                elseif params.target_cell_num==0
+                    ci = cellfun(@(x) max([find(cell2mat(cellfun(@length,x.units{1},'uni',0))>...
+                        params.target_cell_num,1,'last'),0]),ti);
+                    ncel = ci(ikey);
+                    if ncel==0;continue;end
+                else
+                    ci = cellfun(@(x) max([find(cell2mat(cellfun(@length,x.units{1},'uni',0))>...
+                        params.target_cell_num-1,1,'first'),0]),ti);
+                    ncel = ci(ikey);
+                    if ncel==0; perf{ikey} = nan;continue;end
+                end
+                if params.median_over_trials
+                     for icell = ncel
+                        P = cellfun(@(x) x(:,:,icell),p{ikey},'uni',0);
+                        for iclass = 1:size(P,1)
+                            prf = nan(size(P{1},1),1);
+                            for itrial = 1:size(P{1},1)
+                                CM = nan(size(P,2));
+                                for igroup = 1:size(P,2)
+                                    for itest = 1:size(P,2)
+                                        CM(igroup,itest) = nansum(P{iclass,igroup}(itrial,:)==itest);
+                                    end
+                                end
+                                if params.mi
+                                    prf(itrial) = self.getMI(CM);
+                                else
+                                    prf(itrial) = sum(diag(CM))/sum(CM(:));
+                                end
+                            end
+                            perf{ikey}(end+1) = nanmedian(prf);
+                        end
+                    end
+                else
+                    for icell = ncel
+                        P = cellfun(@(x) x(:,:,icell),p{ikey},'uni',0);
+                        for iclass = 1:size(P,1)
+                            CM = nan(size(P,2));
+                            for igroup = 1:size(P,2)
+                                for itest = 1:size(P,2)
+                                    CM(igroup,itest) = nansum(P{iclass,igroup}(:)==itest);
+                                end
+                            end
+                            if params.mi
+                                perf{ikey}(end+1) = self.getMI(CM);
+                            else
+                                perf{ikey}(end+1) = sum(diag(CM))/sum(CM(:));
+                            end
+                        end
+                    end
+                end
             end
-            
-            % plot
-            figure;
-            plotMask(anatomy.Masks)
-            colormap(params.colormap)
-            c = colorbar;
-            
-            % set min/max
-            mx = max(cellfun(@nanmean,MI));
-            mn = min(cellfun(@nanmean,MI));
-            if ~isempty(params.mx);mx = params.mx;end
-            if ~isempty(params.mn);mn = params.mn;end
-            
-            for iarea = 1:length(areas)
-                mi = nanmean(MI{iarea});
-                if isnan(mi);continue;end
-                idx = double(uint8(floor(((mi-mn)/(mx - mn))*0.99*size(params.colormap,1)))+1);
-                if params.sitenum; n = sum(~isnan(MI{iarea}));else n = [];end
-                plotMask(anatomy.Masks & ['brain_area="' areas{iarea} '"'],params.colormap(idx,:),n)
+            if all(cellfun(@length,perf)==1) && params.autoconvert
+                perf = cell2mat(perf);
             end
-            
-            if params.tinybar; ml = 2;else ml =5;end
-            if params.mi
-                labl = 'Mutual Information (bits)';
-                set(c,'ytick',linspace(0,1,ml),'yticklabel',roundall(linspace(mn,mx,ml),10^-round(abs(log10(mn/10)))))
-            else
-                labl = 'Classification performance (%)';
-                set(c,'ytick',linspace(0,1,ml),'yticklabel',round(linspace(mn*100,mx*100,ml)))
-            end
-            if params.tinybar; set(c,'Position',[0.88 0.14 0.025 0.3]);end
-            ylabel(c,labl,'Rotation',-90,'VerticalAlignment','baseline','fontsize',params.fontsize)
-            set(gcf,'name','Decoding performance - All areas')
         end
-        
     end
     
     methods (Static)
