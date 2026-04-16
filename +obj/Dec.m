@@ -115,10 +115,10 @@ classdef Dec < dj.Computed
             
             % get decoder parameters
             [decoder,k_fold,shuffle,repetitions,select_method, ...
-                dec_params, neurons,fold_selection, binsize, dat_norm, trial_method] = ...
+                dec_params, neurons,fold_selection, binsize, dat_norm, trial_method, rf_limit, binnumber] = ...
                 fetch1(obj.DecodeOpt & key,...
                 'decoder','k_fold','shuffle','repetitions','select_method',...
-                'dec_params','neurons','fold_selection','binsize','normalize','trial_method');
+                'dec_params','neurons','fold_selection','binsize','normalize','trial_method','rf_limit','binnumber');
             
             % define decoder function
             if ~isempty(dec_params);dec_params = [',' dec_params];end
@@ -136,11 +136,130 @@ classdef Dec < dj.Computed
                 % initialize
                 groups = []; test_groups = []; train_idx = []; test_idx = [];
                 group_num = length(Data);
+
+                % get cell index
+                rseed.reset; % reset seed in order to get same unit ids for same datasets
+                cell_idx = randperm(rseed,size(Data{1},1));
+                switch select_method
+                    case 'subsample'
+                        cell_num = tril(true(numel(cell_idx)),0);
+                        cell_num = cell_num([1 2.^(1:log2(numel(cell_idx)-1)) numel(cell_idx)],:);
+                    case 'subsample2'
+                        ncells = numel(cell_idx);
+                        cell_num = tril(true(ncells),0);
+                        cell_num = cell_num([floor(1.5.^(1:(log(ncells) / log(1.5)))) ncells],:);
+                    case 'all'
+                        cell_num = true(size(cell_idx));
+                    case 'single'
+                        cell_num = diag(true(size(cell_idx)));
+                    case 'fixed'
+                        if neurons>size(Data{1},1); fprintf('Recording only has %d neurons!',size(Data{1},1));return;end
+                        cell_num = false(1,numel(cell_idx));
+                        cell_num(1:neurons) = true;
+                    case 'rf'
+                        % % get all rfs to compute center
+                        % [x,y] = getDegrees(tune.DotRFMap & (fuse.ScanDone & key) & 'p_value<0.05'& 'snr>1',1);
+                        % mx = mean(x);
+                        % my = mean(y);
+                        % [x,y, keys] = getDegrees(tune.DotRFMap & (fuse.ScanDone & key) & ...
+                        %     'p_value<0.05' & 'snr>1' & (anatomy.AreaMembership & key),1);
+                        
+                        % get all rfs to compute center of each brain area 
+                        [x,y, keys] = getDegrees(tune.DotRFMap & (fuse.ScanDone & key) & ...
+                            'p_value<0.05' & 'snr>1' & (anatomy.AreaMembership & key),1);
+                        mx = median(x);
+                        my = median(y);
+                        % % idx = (mx-10)<x & x<(mx+10) & (my-10)<y & y<(my+10);
+                        idx = pdist2([x(:) y(:)],[mx my]) < rf_limit;
+                        
+                        % % fetch gauss_fit for spatially selected units
+                        % sel_keys   = keys(idx_spatial);
+                        % gauss_fits = fetchn(tune.DotRFMap & sel_keys, 'gauss_fit');
+                        % gauss_mat  = cell2mat(gauss_fits');   % [7 x N]
+                        % sx_all     = gauss_mat(3, :);         % sigma_x for all spatially selected units
+                        % sy_all     = gauss_mat(4, :);         % sigma_y for all spatially selected units
+                        
+                        sel_units = [keys(idx).unit_id];
+                        sel_units = sel_units(randperm(length(sel_units)));
+                        [~,unit_idx] = intersect(unit_ids(cell_idx),sel_units,'stable');
+                        %indexes = [1 10:10:99 100:100:length(unit_idx) length(unit_idx)];
+                        if neurons>size(Data{1},1); error('Recording only has %d neurons!',size(Data{1},1));
+                            end
+                        indexes = neurons;
+                        cell_num = false(length(indexes),numel(cell_idx));
+                        for i = 1:length(indexes)
+                            cell_num(i,unit_idx(1:indexes(i))) = true;
+                        end
+
+                    case 'location'
+                        % get all rfs to compute center
+                        [x,y,keys] = fetchn(meso.ScanSetUnitInfo*anatomy.AreaMembership & key,'um_x','um_y');
+                        mx = median(x);
+                        my = median(y);
+                        % idx = (mx-10)<x & x<(mx+10) & (my-10)<y & y<(my+10);
+                        idx = pdist2([x(:) y(:)],[mx my]) < rf_limit;
+                        sel_units = [keys(idx).unit_id];
+                        sel_units = sel_units(randperm(length(sel_units)));
+                        [~,unit_idx] = intersect(unit_ids(cell_idx),sel_units,'stable');
+                        %indexes = [1 10:10:99 100:100:length(unit_idx) length(unit_idx)];
+                        if neurons>size(Data{1},1); error('Recording only has %d neurons!',size(Data{1},1));
+                            end
+                        indexes = neurons;
+                        cell_num = false(length(indexes),numel(cell_idx));
+                        for i = 1:length(indexes)
+                            cell_num(i,unit_idx(1:indexes(i))) = true;
+                        end
+                    case 'reliable'
+                        [r,keys] = fetchn(obj.RepeatsUnit & (anatomy.AreaMembership & key) & 'rep_opt = 2','r');
+                        ids = [keys.unit_id];
+                        un_ids = unique(ids);
+                        rel = nan(length(un_ids),1);
+                        for i = 1:length(un_ids)
+                            rel(i) = nanmean((r(ids==un_ids(i))));
+                        end
+                        
+                        % select nneurons most reliable
+                        if neurons>size(Data{1},1); error('Recording only has %d neurons!',size(Data{1},1));end
+                        [~,sort_idx] = sort(rel,'descend');
+                        sel_units = un_ids(sort_idx);
+                        indexes = neurons;
+                        [~,unit_idx] = intersect(unit_ids(cell_idx),sel_units(1:indexes));
+                        cell_num = false(length(indexes),numel(cell_idx));
+                        for i = 1:length(indexes)
+                            cell_num(i,unit_idx(1:indexes(i))) = true;
+                        end
+                    case 'reliablev2'
+                        [r,keys] = fetchn(obj.RepeatsUnit & (anatomy.AreaMembership & key) & 'rep_opt = 2','r');
+                        ids = [keys.unit_id];
+                        un_ids = unique(ids);
+                        rel = nan(length(un_ids),1);
+                        for i = 1:length(un_ids)
+                            rel(i) = nanmean((r(ids==un_ids(i))));
+                        end
+                        
+                        % select nneurons with reliability above 0.2
+                        if neurons>size(Data{1},1); error('Recording only has %d neurons!',size(Data{1},1));end
+                        sel_units = un_ids(rel>0.2);
+                        indexes = neurons;
+                        [~,unit_idx] = intersect(unit_ids(cell_idx),sel_units);
+                        cell_num = false(length(indexes),numel(cell_idx));
+                        for i = 1:length(indexes)
+                            cell_num(i,unit_idx(randperm(rseed,length(unit_idx),indexes))) = true;
+                        end
+                    otherwise
+                        error('Cell selection method not supported')
                 
+                end
+
+                % % you should keep the selected neurons only
+                % Data = cellfun(@(x) x(cell_num, :), Data, 'UniformOutput', false);
+                % % get test data
+                %  test_Data = Data;
+
                 % equalize by undersampling shorter class & randomize trial sequence
                 msz = min(cellfun(@(x) size(x,2),Data)); % calculate minimum class length
                 msz_test = min(cellfun(@(x) size(x,2),test_Data)); % calculate minimum class length
-                
+
                 % trial selection
                 switch trial_method
                     case 'random' % randomize trial sequence
@@ -166,17 +285,52 @@ classdef Dec < dj.Computed
                         test_data_idx = train_data_idx;
                         msz = min(cellfun(@length,train_data_idx));
                         msz_test = msz;
+                    case 'firing_rate'
+                        temp_data =  cellfun(@(x) x(cell_num, :), Data, 'UniformOutput', false);
+                        for iclass = 1:group_num
+                             % Calculate average mean firing rate
+                             mean_firing_rate = mean(temp_data{iclass}(:));
+                             
+                             % Perform t-test for each neuron against
+                             % overall mean 
+                             p_values = zeros(1, msz);
+                             for i = 1:msz
+                                 [~, p_values(i)] = ttest(temp_data{iclass}(:,i), mean_firing_rate);
+                             end
+
+                             % Find neurons that are not significanlty
+                             % different (p > 0.05)
+                             selected_bins = find(p_values > 0.01);
+                            
+                             % Create indices for training/testing
+                             % (randomly)
+                             if length(selected_bins) >= binnumber
+                                 idx = selected_bins(randsample(length(selected_bins), binnumber));
+                             else
+                                  warning('Not enough bins (found %d, needed %d) for class %d', length(selected_bins), binnumber, iclass);
+                             %     idx = selected_bins(randsample(length(selected_bins),length(selected_bins)));
+                             end
+                             %idx = selected_bins(randsample(length(selected_bins),length(selected_bins)));
+                             train_data_idx{iclass} = idx; % create bin index
+                        end
+                        
+                        % All classes have equal number of bins
+                        % Find the minimum length
+                        min_len = min(cellfun(@length, train_data_idx));
+                        train_data_idx = cellfun(@(x) x(1:min_len), train_data_idx, 'UniformOutput', false);
+                        test_data_idx = train_data_idx;
+                        msz = min(cellfun(@length,train_data_idx));
+                        msz_test = msz;
                 end
                 
                 % calculate fold bin size and recompute minimum length of data
-                if k_fold==1;bins = msz;elseif k_fold==0;bins=1;else, bins = k_fold;end
+                if k_fold<2;bins = msz;else;bins = k_fold;end
                 bin_sz = floor(msz/bins);
                 msz = bin_sz*bins;
                 
                 % test data
                 test_bin_sz = floor(msz_test/bins); % calculate fold bin size and recompute minimum length of data
                 msz_test = test_bin_sz*bins;
-                
                 % equalize by undersampling shorter class
                 train_data_idx = cellfun(@(x) x(1:msz),train_data_idx,'uni',0);
                 test_data_idx = cellfun(@(x) x(1:msz_test),test_data_idx,'uni',0);
@@ -194,6 +348,50 @@ classdef Dec < dj.Computed
                                 train_idx{iclass}(1 + (ibin-1)*bin_sz      :      bin_sz*ibin) = ibin;
                                 test_idx{iclass} (1 + (ibin-1)*test_bin_sz : test_bin_sz*ibin) = ibin;
                             end
+                        case 'firing_rate'
+                             % Calculate average mean firing rate
+                             mean_firing_rate = mean(Data{iclass}(:));
+                             
+                             % Calculate mean firing  rate for each neuron
+                             % (1x1700)
+                             neuron_means = mean(Data{iclass}, 1);
+
+                             % Perform t-test for each neuron against
+                             % overall mean 
+                             p_values = zeros(1, msz);
+                             for i = 1:msz
+                                 [~, p_values(i)] = ttest(Data{iclass}(:,i), mean_firing_rate);
+                             end
+
+                             % Find neurons that are not significanlty
+                             % different (p > 0.05)
+                             selected_bins = find(p_values > 0.05);
+
+                              % buld index
+                             for i_idx = 1:length(selected_bins)
+                                 train_idx{iclass}(i_idx) = mod(fix(selected_bins(i_idx)/bin_sz)+1, selected_bins(i_idx));
+                                 test_idx{iclass}(i_idx) = mod(fix(selected_bins(i_idx)/bin_sz)+1, selected_bins(i_idx));
+                             end
+
+                             groups{iclass} = ones(1,size(train_idx{iclass},2)) * iclass;
+                             test_groups{iclass} = ones(1,size(test_idx{iclass},2)) * iclass;
+                            
+                             % Create indices for training/testing (randomly
+                             idx = selected_bins(randsample(length(selected_bins),length(selected_bins)));
+                             train_data_idx{iclass} = idx; % create bin index
+                             test_data_idx{iclass} = idx;
+
+                             % % buld index
+                             % for ibin = 1:bins
+                             %     train_idx{iclass}(1 + (ibin-1)*bin_sz      :      bin_sz*ibin) = ibin;
+                             %     test_idx{iclass} (1 + (ibin-1)*test_bin_sz : test_bin_sz*ibin) = ibin;
+                             % end
+
+                             % before randomization
+                             % for i_idx = 1:length(idx)
+                             %      train_idx{iclass}(i_idx) = mod(fix(idx(i_idx)/bin_sz)+1, idx(i_idx))
+                             % end
+
                         case {'x','y','frame_id','scale','rotation','tilt','light1_xloc','light1_yloc','light3_yloc','light2_ene'}
                             
                             keys = cell2struct([num2cell(train_info.clips{iclass}(train_data_idx{iclass}),2),...
@@ -265,83 +463,83 @@ classdef Dec < dj.Computed
                 test_shfl_groups = test_groups(test_shfl_idx);
                 data_shfl_idx = test_data_idx(test_shfl_idx);
                 
-                % get cell index
-                rseed.reset; % reset seed in order to get same unit ids for same datasets
-                cell_idx = randperm(rseed,size(Data{1},1));
-                switch select_method
-                    case 'subsample'
-                        cell_num = tril(true(numel(cell_idx)),0);
-                        cell_num = cell_num([1 2.^(1:log2(numel(cell_idx)-1)) numel(cell_idx)],:);
-                    case 'subsample2'
-                        ncells = numel(cell_idx);
-                        cell_num = tril(true(ncells),0);
-                        cell_num = cell_num([floor(1.5.^(1:(log(ncells) / log(1.5)))) ncells],:);
-                    case 'all'
-                        cell_num = true(size(cell_idx));
-                    case 'single'
-                        cell_num = diag(true(size(cell_idx)));
-                    case 'fixed'
-                        if neurons>size(Data{1},1); fprintf('Recording only has %d neurons!',size(Data{1},1));return;end
-                        cell_num = false(1,numel(cell_idx));
-                        cell_num(1:neurons) = true;
-                    case 'rf'
-                        % get all rfs to compute center
-                        [x,y] = getDegrees(tune.DotRFMap & (fuse.ScanDone & key) & 'p_value<0.05',1);
-                        mx = mean(x);
-                        my = mean(y);
-                        [x,y, keys] = getDegrees(tune.DotRFMap & (fuse.ScanDone & key) & ...
-                            'p_value<0.05' & (anatomy.AreaMembership & key),1);
-                        %                         idx = (mx-10)<x & x<(mx+10) & (my-10)<y & y<(my+10);
-                        idx = pdist2([x(:) y(:)],[mx my]) < 10;
-                        sel_units = [keys(idx).unit_id];
-                        [~,unit_idx] = intersect(unit_ids(cell_idx),sel_units);
-                        %indexes = [1 10:10:99 100:100:length(unit_idx) length(unit_idx)];
-                        if neurons>size(Data{1},1); error('Recording only has %d neurons!',size(Data{1},1));end
-                        indexes = neurons;
-                        cell_num = false(length(indexes),numel(cell_idx));
-                        for i = 1:length(indexes)
-                            cell_num(i,unit_idx(1:indexes(i))) = true;
-                        end
-                    case 'reliable'
-                        [r,keys] = fetchn(obj.RepeatsUnit & (anatomy.AreaMembership & key) & 'rep_opt = 2','r');
-                        ids = [keys.unit_id];
-                        un_ids = unique(ids);
-                        rel = nan(length(un_ids),1);
-                        for i = 1:length(un_ids)
-                            rel(i) = nanmean((r(ids==un_ids(i))));
-                        end
-                        
-                        % select nneurons most reliable
-                        if neurons>size(Data{1},1); error('Recording only has %d neurons!',size(Data{1},1));end
-                        [~,sort_idx] = sort(rel,'descend');
-                        sel_units = un_ids(sort_idx);
-                        indexes = neurons;
-                        [~,unit_idx] = intersect(unit_ids(cell_idx),sel_units(1:indexes));
-                        cell_num = false(length(indexes),numel(cell_idx));
-                        for i = 1:length(indexes)
-                            cell_num(i,unit_idx(1:indexes(i))) = true;
-                        end
-                    case 'reliablev2'
-                        [r,keys] = fetchn(obj.RepeatsUnit & (anatomy.AreaMembership & key) & 'rep_opt = 2','r');
-                        ids = [keys.unit_id];
-                        un_ids = unique(ids);
-                        rel = nan(length(un_ids),1);
-                        for i = 1:length(un_ids)
-                            rel(i) = nanmean((r(ids==un_ids(i))));
-                        end
-                        
-                        % select nneurons with reliability above 0.2
-                        if neurons>size(Data{1},1); error('Recording only has %d neurons!',size(Data{1},1));end
-                        sel_units = un_ids(rel>0.2);
-                        indexes = neurons;
-                        [~,unit_idx] = intersect(unit_ids(cell_idx),sel_units);
-                        cell_num = false(length(indexes),numel(cell_idx));
-                        for i = 1:length(indexes)
-                            cell_num(i,unit_idx(randperm(rseed,length(unit_idx),indexes))) = true;
-                        end
-                    otherwise
-                        error('Cell selection method not supported')
-                end
+                % %% get cell index
+                % rseed.reset; % reset seed in order to get same unit ids for same datasets
+                % cell_idx = randperm(rseed,size(Data{1},1));
+                % switch select_method
+                %     case 'subsample'
+                %         cell_num = tril(true(numel(cell_idx)),0);
+                %         cell_num = cell_num([1 2.^(1:log2(numel(cell_idx)-1)) numel(cell_idx)],:);
+                %     case 'subsample2'
+                %         ncells = numel(cell_idx);
+                %         cell_num = tril(true(ncells),0);
+                %         cell_num = cell_num([floor(1.5.^(1:(log(ncells) / log(1.5)))) ncells],:);
+                %     case 'all'
+                %         cell_num = true(size(cell_idx));
+                %     case 'single'
+                %         cell_num = diag(true(size(cell_idx)));
+                %     case 'fixed'
+                %         if neurons>size(Data{1},1); fprintf('Recording only has %d neurons!',size(Data{1},1));return;end
+                %         cell_num = false(1,numel(cell_idx));
+                %         cell_num(1:neurons) = true;
+                %     case 'rf'
+                %         % get all rfs to compute center
+                %         [x,y] = getDegrees(tune.DotRFMap & (fuse.ScanDone & key) & 'p_value<0.05',1);
+                %         mx = mean(x);
+                %         my = mean(y);
+                %         [x,y, keys] = getDegrees(tune.DotRFMap & (fuse.ScanDone & key) & ...
+                %             'p_value<0.05' & (anatomy.AreaMembership & key),1);
+                %         %                         idx = (mx-10)<x & x<(mx+10) & (my-10)<y & y<(my+10);
+                %         idx = pdist2([x(:) y(:)],[mx my]) < rf_limit;
+                %         sel_units = [keys(idx).unit_id];
+                %         [~,unit_idx] = intersect(unit_ids(cell_idx),sel_units);
+                %         %indexes = [1 10:10:99 100:100:length(unit_idx) length(unit_idx)];
+                %         if neurons>size(Data{1},1); error('Recording only has %d neurons!',size(Data{1},1));end
+                %         indexes = neurons;
+                %         cell_num = false(length(indexes),numel(cell_idx));
+                %         for i = 1:length(indexes)
+                %             cell_num(i,unit_idx(1:indexes(i))) = true;
+                %         end
+                %     case 'reliable'
+                %         [r,keys] = fetchn(obj.RepeatsUnit & (anatomy.AreaMembership & key) & 'rep_opt = 2','r');
+                %         ids = [keys.unit_id];
+                %         un_ids = unique(ids);
+                %         rel = nan(length(un_ids),1);
+                %         for i = 1:length(un_ids)
+                %             rel(i) = nanmean((r(ids==un_ids(i))));
+                %         end
+                % 
+                %         % select nneurons most reliable
+                %         if neurons>size(Data{1},1); error('Recording only has %d neurons!',size(Data{1},1));end
+                %         [~,sort_idx] = sort(rel,'descend');
+                %         sel_units = un_ids(sort_idx);
+                %         indexes = neurons;
+                %         [~,unit_idx] = intersect(unit_ids(cell_idx),sel_units(1:indexes));
+                %         cell_num = false(length(indexes),numel(cell_idx));
+                %         for i = 1:length(indexes)
+                %             cell_num(i,unit_idx(1:indexes(i))) = true;
+                %         end
+                %     case 'reliablev2'
+                %         [r,keys] = fetchn(obj.RepeatsUnit & (anatomy.AreaMembership & key) & 'rep_opt = 2','r');
+                %         ids = [keys.unit_id];
+                %         un_ids = unique(ids);
+                %         rel = nan(length(un_ids),1);
+                %         for i = 1:length(un_ids)
+                %             rel(i) = nanmean((r(ids==un_ids(i))));
+                %         end
+                % 
+                %         % select nneurons with reliability above 0.2
+                %         if neurons>size(Data{1},1); error('Recording only has %d neurons!',size(Data{1},1));end
+                %         sel_units = un_ids(rel>0.2);
+                %         indexes = neurons;
+                %         [~,unit_idx] = intersect(unit_ids(cell_idx),sel_units);
+                %         cell_num = false(length(indexes),numel(cell_idx));
+                %         for i = 1:length(indexes)
+                %             cell_num(i,unit_idx(randperm(rseed,length(unit_idx),indexes))) = true;
+                %         end
+                %     otherwise
+                %         error('Cell selection method not supported')
+                % end
                 
                 % classify
                 P = cellfun(@(x) nan(size(cell_num,1),size(x,2),'single'),test_Data,'uni',0);R = P;S = P;D = [];
@@ -360,10 +558,13 @@ classdef Dec < dj.Computed
                             idx = train_idx ~= ibin;
                             tidx = test_idx == ibin;
                         end
-                        
+
                         % run classifier
                         DEC = decoder_func(data(cell_idx(cell_num(icell,:)),idx)',groups(idx)');
                         [pre, sc] = predict(DEC,test_data(cell_idx(cell_num(icell,:)),tidx)'); % test decoder
+
+                        % DEC = decoder_func(data(:,idx)',groups(idx)');
+                        % [pre, sc] = predict(DEC,test_data(:,tidx)'); % test decoder
                         
                         % Assign performance data into bins
                         p = pre;
